@@ -10,6 +10,13 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from movebank.infrastructure.http.client import HttpClient
+from movebank.infrastructure.http.exceptions import (
+    HttpClientError,
+    HttpStatusError,
+)
+from movebank.infrastructure.http.response import HttpResponse
+
 logger = logging.getLogger(__name__)
 URL = "https://www.movebank.org/movebank/service/direct-read"
 _request_lock = threading.Lock()
@@ -17,7 +24,8 @@ _last_request = 0.0
 
 
 class MovebankError(Exception):
-    pass
+    status_code: int | None = None
+    response: HttpResponse | None = None
 
 
 class LicenseRequired(MovebankError):
@@ -46,13 +54,15 @@ class MovebankClient:
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET"],
+            raise_on_status=False,
             respect_retry_after_header=True,
         )
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
         self.interval = interval
+        self._http_client = HttpClient(timeout=(15, 120), session=self.session)
 
     def close(self) -> None:
-        self.session.close()
+        self._http_client.close()
 
     def _get(self, params: Mapping[str, str | int]) -> bytes:
         global _last_request
@@ -62,16 +72,18 @@ class MovebankClient:
                 if delay > 0:
                     time.sleep(delay)
                 try:
-                    response = self.session.get(URL, params=params, timeout=(15, 120))
+                    response = self._http_client.get(URL, params=params, timeout=(15, 120))
                 finally:
                     _last_request = time.monotonic()
-                response.raise_for_status()
                 content = response.content
-        except requests.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else "desconocido"
+        except HttpStatusError as exc:
+            status = exc.response.status_code
             logger.warning("Movebank devolvio HTTP %s", status)
-            raise MovebankError(f"Movebank devolvio HTTP {status}.") from exc
-        except requests.RequestException as exc:
+            error = MovebankError(f"Movebank devolvio HTTP {status}.")
+            error.status_code = status
+            error.response = exc.response
+            raise error from exc
+        except HttpClientError as exc:
             logger.warning("Error HTTP al consultar Movebank: %s", type(exc).__name__)
             raise MovebankError(f"Error al consultar Movebank: {type(exc).__name__}") from exc
         return content

@@ -12,7 +12,13 @@ movebank_migracion/
       analytics.py           mediciones de movilidad
       spatial.py             envolvente convexa y limites GeoJSON
     infrastructure/
-      movebank/              cliente HTTP y servicios de entidades
+      http/                  transporte HTTP generico
+        client.py            solicitudes y sesiones reutilizables
+        response.py          metadatos y contenido de respuesta
+        exceptions.py        errores genericos de transporte HTTP
+      movebank/
+        client.py            autenticacion, licencias y CSV de Movebank
+        services.py          servicios de estudios, individuos y eventos
       persistence/store.py   almacenamiento SQLite con SQLAlchemy
     application/
       ports.py               contratos de sincronizacion
@@ -27,6 +33,16 @@ movebank_migracion/
 ```
 
 El dominio no depende de la interfaz, el cliente ni la base de datos. Los casos de uso coordinan servicios y persistencia mediante contratos; la configuracion de infraestructura conecta las implementaciones concretas. Se elige **SQLite** frente a DuckDB: es suficiente para sincronizar registros por individuo, permite transacciones y claves primarias, no requiere servidor y SQLAlchemy lo soporta directamente. DuckDB seria una evolucion adecuada para consultas analiticas masivas sobre Parquet, pero aqui no compensa mantener dos almacenes. La API REST propia, colas, procesamiento distribuido y permisos multiusuario quedan fuera de esta primera version: no exponer Streamlit a redes no confiables.
+
+### Transporte HTTP y cliente Movebank
+
+`HttpClient` es el transporte generico basado en `requests.Session`. Admite GET, POST, PUT, PATCH, DELETE y solicitudes genericas. Para estados HTTP inferiores a 400 devuelve un `HttpResponse` con metodo, URL, estado, cabeceras, duracion, tipo de contenido, texto y bytes; para estados de 400 o superiores lanza `HttpStatusError`, que conserva ese `HttpResponse`. Tambien distingue errores de conexion, timeout y transporte. El parsing JSON se realiza bajo demanda mediante `HttpResponse.json()`, que puede lanzar un error de interpretacion. `HttpClient` no interpreta respuestas de Movebank ni conoce sus endpoints o licencias. Sus mensajes de logging propios no incorporan cabeceras ni cuerpos de solicitud; esto no es un mecanismo global de sanitizacion de logs.
+
+`MovebankClient` compone `HttpClient` y conserva las responsabilidades especificas de Movebank: autenticacion Basic cuando se proporcionan credenciales, parametros de `direct-read`, control de frecuencia, licencias, MD5, excepciones Movebank y validacion CSV. Crea y configura una unica sesion `requests.Session`, y entrega esa misma sesion a `HttpClient`; el transporte respeta los adaptadores ya configurados. `MovebankClient.close()` cierra la sesion compartida. `HttpClient.close()` cierra la sesion que tiene asignada, tambien si fue inyectada externamente; no hay una proteccion especifica frente a llamadas repetidas a `close()`.
+
+Los errores genericos de transporte se convierten en `MovebankError` y conservan la causa encadenada. Los errores HTTP mantienen tambien el codigo de estado y el objeto de respuesta. `LicenseRequired` sigue siendo una excepcion especifica de Movebank y no se convierte en un error generico.
+
+Cuando la respuesta incluye `License Terms:`, `MovebankClient` conserva los bytes originales y calcula sobre ellos el MD5 requerido por el protocolo al crear `LicenseRequired`. El hash esta disponible antes de solicitar la decision del usuario. Los flujos de CLI y Streamlit muestran los terminos y solicitan confirmacion; `MovebankClient` no puede acreditar por si mismo una autorizacion humana, solo verifica que el `approved_md5` recibido coincide con el esperado. Si coincide, envia una segunda solicitud con `license-md5` usando la misma sesion. No hay aceptacion automatica: sin ese MD5 coincidente no se envia la solicitud posterior. Las respuestas CSV se decodifican con `utf-8-sig` para admitir BOM; se validan las cabeceras requeridas y las filas malformadas.
 
 Las claves internas de Movebank pueden cambiar y los identificadores locales solo son unicos dentro de un estudio. La caché usa IDs internos para consultar y guardar snapshots, conserva identificadores locales y debe actualizarse si se recrean entidades. Cada descarga sustituye atomicamente los eventos del individuo; incluso una descarga vacia queda marcada como completa. La caché no detecta cambios remotos: use actualizacion explicita. Los archivos SQLite contienen potencialmente datos privados sin cifrar; proteja su acceso y no los comparta.
 
@@ -59,9 +75,26 @@ La CLI y el dashboard leen `.env` del directorio desde el que se ejecutan; inici
 
 Abra [consulta_movebank.ipynb](consulta_movebank.ipynb) en VS Code y seleccione el kernel de `.venv`. Si no tiene soporte de notebooks en ese entorno, instale `.\.venv\Scripts\python.exe -m pip install -e ".[notebook]"`. Ejecute las celdas en orden: el notebook consulta la API real y muestra los estudios con mas de tres individuos. Sus resultados se mantienen en el notebook, no se cargan automaticamente en la cache del dashboard. Antes de compartirlo, borre sus salidas si contienen datos cuyo acceso o redistribucion este restringido.
 
-Cuando Movebank devuelve una licencia, se muestra el contenido completo. Solo tras la confirmacion explicita se calcula y envia el MD5 del contenido exacto, conservando las cookies de sesion. Si los terminos cambian se solicita una nueva aceptacion. El MD5 es un requisito del protocolo, no una garantia criptografica. No se almacenan aceptaciones para uso futuro.
+Los flujos de CLI, Streamlit y el notebook muestran el contenido de la licencia y solicitan confirmacion antes de volver a llamar con el MD5 coincidente. Si los terminos cambian, se solicita una nueva aceptacion. El MD5 es un requisito del protocolo, no una garantia criptografica, y las aceptaciones no se almacenan para uso futuro. La sesion compartida permite reutilizar las cookies administradas por `requests.Session`.
 
-La API limita a **una solicitud concurrente por IP** y 20 globalmente. Este cliente serializa las llamadas dentro de su proceso y espera un segundo entre ellas, con reintentos para 429 y errores transitorios. No coordina varios procesos o maquinas que compartan IP: ejecute una sola instancia y evite otros clientes simultaneos. El limite de frecuencia exacto no es una garantia de Movebank.
+La API limita a **una solicitud concurrente por IP** y 20 globalmente. `MovebankClient` serializa las llamadas dentro de su proceso y espera un segundo entre ellas. Su adaptador conserva la politica historica de reintentos:
+
+```python
+Retry(
+    total=3,
+    connect=None,
+    read=None,
+    status=None,
+    other=None,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+    respect_retry_after_header=True,
+    raise_on_status=False,
+)
+```
+
+Los campos `connect`, `read`, `status` y `other` quedan en `None` en la configuracion efectiva; el contador global `total` limita los reintentos. Los reintentos por estado HTTP se limitan a GET mediante `allowed_methods`. Los errores de conexion siguen otra ruta: pueden consumir el presupuesto global incluso para otros metodos HTTP. La integracion actual de Movebank envia consultas GET. `raise_on_status=False` permite que la respuesta HTTP final llegue a `HttpClient` para su tratamiento y diagnostico. Si `HttpClient` crea su propia sesion, usa sus adaptadores predeterminados; si recibe una sesion externa, conserva sus adaptadores y la politica de reintentos ya configurada. No coordina varios procesos o maquinas que compartan IP: ejecute una sola instancia y evite otros clientes simultaneos. El limite de frecuencia exacto no es una garantia de Movebank.
 
 ## Docker
 
@@ -86,6 +119,8 @@ Los estudios se filtran por taxon, sensor y ano comprendido entre las fechas de 
 .\.venv\Scripts\python.exe -m ruff check src tests
 .\.venv\Scripts\python.exe -m mypy src
 ```
+
+La validacion de la integracion HTTP de la FASE 4 ejecuto **64 pruebas**, con **90,65 % de cobertura global** frente al minimo configurado del **80 %**. Las pruebas de transporte e integracion usan respuestas simuladas y no realizan llamadas a Movebank. El notebook no se ejecuto durante esa validacion; al ejecutarlo manualmente, consulta la API real.
 
 Las pruebas controladas no sustituyen una integracion real autenticada. Para verificarla, use una cuenta propia y un estudio cuyo uso este autorizado; contraste el CSV, los permisos, los terminos y las cifras con Movebank. No se incluyen credenciales ni datos de terceros.
 
