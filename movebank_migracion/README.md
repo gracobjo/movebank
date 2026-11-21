@@ -9,6 +9,7 @@ movebank_migracion/
   src/movebank/
     domain/
       models.py              modelos Pydantic
+      event_normalization.py normalizacion de filas CSV antes del analisis
       analytics.py           mediciones de movilidad
       spatial.py             envolvente convexa y limites GeoJSON
     infrastructure/
@@ -18,6 +19,7 @@ movebank_migracion/
         exceptions.py        errores genericos de transporte HTTP
       movebank/
         client.py            autenticacion, licencias y CSV de Movebank
+        consent.py           flujo de consentimiento desacoplado de la interfaz
         services.py          servicios de estudios, individuos y eventos
       persistence/store.py   almacenamiento SQLite con SQLAlchemy
     application/
@@ -44,20 +46,36 @@ Los errores genericos de transporte se convierten en `MovebankError` y conservan
 
 Cuando la respuesta incluye `License Terms:`, `MovebankClient` conserva los bytes originales y calcula sobre ellos el MD5 requerido por el protocolo al crear `LicenseRequired`. El hash esta disponible antes de solicitar la decision del usuario. Los flujos de CLI y Streamlit muestran los terminos y solicitan confirmacion; `MovebankClient` no puede acreditar por si mismo una autorizacion humana, solo verifica que el `approved_md5` recibido coincide con el esperado. Si coincide, envia una segunda solicitud con `license-md5` usando la misma sesion. No hay aceptacion automatica: sin ese MD5 coincidente no se envia la solicitud posterior. Las respuestas CSV se decodifican con `utf-8-sig` para admitir BOM; se validan las cabeceras requeridas y las filas malformadas.
 
+`run_with_consent()` coordina una operacion y delega la decision en un callback, sin usar `input()` ni `print()` en el mecanismo compartido. El adaptador de CLI conserva la pregunta `ACEPTO`, sus mensajes y su salida por `SystemExit`; otra interfaz puede presentar los mismos terminos con su propia interaccion. Los MD5 aceptados se conservan solo durante esa operacion, nunca entre llamadas. Si una licencia distinta aparece durante el reintento, se solicita otra decision; si se repite el mismo MD5, el error se propaga para evitar un bucle.
+
+### Normalizacion de eventos para analisis
+
+`normalize_events()` prepara las filas CSV de eventos antes de pasarlas a `segments()`, `mobility()`, `daily_distance()` o las funciones espaciales. Devuelve todos los eventos normalizados, incluidos los de visibilidad desconocida, y contadores de aceptacion y rechazo. `hidden_count` cuenta los eventos validados con `visible=False`; `unknown_visibility_count` cuenta los que tienen visibilidad desconocida, y `unknown_visibility_events` permite consultarlos por separado. Para obtener los eventos aptos para analisis, use `events_for_analysis()`: por defecto incluye solo `visible=True`; `visible=False` y `visible=None` quedan excluidos. La inclusion de los desconocidos requiere solicitarla expresamente con `events_for_analysis(include_unknown_visibility=True)`. Ninguna de estas vistas elimina ni modifica los eventos conservados en `events`.
+
+La visibilidad admite booleanos, cadenas sin distincion de mayusculas/minusculas `true`/`false` y valores numericos o cadenas `1`/`0`. Valores vacios, `None` y valores ausentes de pandas como NaN o `pd.NA` se conservan como `None`; valores no vacios desconocidos se rechazan, no se convierten a `True`. Cada fila rechazada se cuenta una sola vez. Los valores de visibilidad y las coordenadas ausentes o invalidas se clasifican durante la normalizacion; para los errores de validacion de `Event`, la prioridad es timestamp, coordenadas y otros errores, en ese orden. Las coordenadas numericas se convierten a `float` y el modelo `Event` valida sus rangos. La normalizacion no imprime ni registra filas.
+
+En los campos opcionales de texto `individual_local_identifier` e `individual_taxon_canonical_name`, `None`, las cadenas vacias o blancas y los marcadores tipados de ausencia (`pandas.NA`, `pandas.NaT`, `numpy.nan` y `numpy.datetime64("NaT")`) se normalizan a `None`. Las cadenas literales `"NaN"` y `"NaT"` se conservan como texto.
+
+Para las coordenadas, las entradas vacias y los marcadores tipados de ausencia se clasifican como `missing_coordinates`. Las cadenas literales `"NaN"` y `"NaT"`, el texto no numerico, los infinitos y los valores fuera de rango se clasifican como `invalid_coordinates`. El `timestamp` es obligatorio: los valores ausentes o invalidos se clasifican como `invalid_timestamp`; `pandas.NaT` no es un timestamp valido.
+
+Los eventos deben quedar asociados a un `individual_id` valido. Cuando la consulta esta acotada a un individuo, `MovebankEventService` completa un identificador ausente o en blanco con el de esa consulta; no asigna identificadores arbitrarios. Los identificadores malformados o incompatibles con la consulta se rechazan. `normalize_events()` tambien rechaza eventos sin identificador, y `mobility()` y `segments()` excluyen defensivamente filas sin `individual_id`.
+
+Las rutas de validacion no son identicas: el modelo `Event` valida campos y restricciones; `normalize_events()` ademas prepara las entradas y clasifica las filas rechazadas. El notebook llama a `normalize_events()` y puede informar esas categorias. CLI y Streamlit guardan mediante `Store.save_events()`, que valida los eventos con `Event` y omite coordenadas ausentes; no presentan necesariamente las mismas categorias de rechazo que el notebook. Streamlit aplica ademas `events_for_analysis()` y excluye la visibilidad desconocida por defecto.
+
 Las claves internas de Movebank pueden cambiar y los identificadores locales solo son unicos dentro de un estudio. La caché usa IDs internos para consultar y guardar snapshots, conserva identificadores locales y debe actualizarse si se recrean entidades. Cada descarga sustituye atomicamente los eventos del individuo; incluso una descarga vacia queda marcada como completa. La caché no detecta cambios remotos: use actualizacion explicita. Los archivos SQLite contienen potencialmente datos privados sin cifrar; proteja su acceso y no los comparta.
 
 ## Instalacion y uso local
 
 Requiere Python 3.12 o posterior.
 
-Edite el archivo `.env` situado en esta carpeta y escriba sus credenciales:
+Copie `.env.example` como `.env` en esta carpeta y complete las variables que aparecen en la plantilla: `MOVEBANK_USERNAME` y `MOVEBANK_PASSWORD`. `.env.example` es una plantilla con valores vacios, no contiene credenciales reales. El archivo `.env` contiene la contrasena **sin cifrar**: proteja el acceso local y no lo comparta ni lo incluya en la entrega. Esta excluido de Git y de la imagen Docker.
 
 ```dotenv
 MOVEBANK_USERNAME='su_usuario'
 MOVEBANK_PASSWORD='su_contrasena'
 ```
 
-Use comillas simples para valores con caracteres especiales; una comilla simple dentro del valor se escribe como `\'`. El archivo contiene la contrasena **sin cifrar**: proteja el acceso local y no lo comparta. Esta excluido de Git y de la imagen Docker. El archivo `.env.example` es una plantilla sin credenciales.
+Use comillas simples para valores con caracteres especiales; una comilla simple dentro del valor se escribe como `\'`.
 
 ```powershell
 cd movebank_migracion
@@ -69,11 +87,23 @@ python -m venv .venv
 .\.venv\Scripts\streamlit.exe run src\movebank\presentation\streamlit\app.py
 ```
 
-La CLI y el dashboard leen `.env` del directorio desde el que se ejecutan; inicie ambos desde esta carpeta. Las variables de entorno existentes tienen prioridad sobre `.env`. Despues de cambiar las credenciales, reinicie el dashboard y cierre las sesiones anteriores del navegador. Si ambas estan vacias, se intenta el acceso anonimo documentado; algunas instalaciones o respuestas pueden exigir autenticacion. Utilice su propia cuenta y permisos. Nunca incluya contrasenas en el codigo ni en el repositorio. La ruta SQLite predeterminada depende de un hash del nombre de usuario; `--database` permite seleccionar otra ruta para la CLI. El dashboard usa el directorio desde el que se inicia y su ruta predeterminada correspondiente. Para refrescar eventos mediante CLI use `--refresh`. Desde el dashboard, «Descargar o actualizar GPS» siempre refresca.
+`credentials()` localiza el `.env` de la raiz de este subproyecto independientemente del directorio de trabajo; tambien admite una ruta explicita. Las variables de entorno existentes tienen prioridad sobre los valores del archivo, por credencial. Despues de cambiar las credenciales, reinicie el dashboard y cierre las sesiones anteriores del navegador. Si ambas estan vacias, se intenta el acceso anonimo documentado; algunas instalaciones o respuestas pueden exigir autenticacion. Utilice su propia cuenta y permisos. Nunca incluya contrasenas en el codigo ni en el repositorio. La ruta SQLite predeterminada sigue dependiendo del directorio desde el que se inicie la CLI o el dashboard; `--database` permite seleccionar otra ruta para la CLI. Para refrescar eventos mediante CLI use `--refresh`. Desde el dashboard, «Descargar o actualizar GPS» siempre refresca.
+
+### Navegacion por Streamlit
+
+En la barra lateral, actualice los estudios, seleccione un estudio y actualice sus individuos; despues seleccione un individuo y descargue o actualice sus eventos GPS. La descarga desde el dashboard siempre refresca los eventos. Las paginas disponibles son:
+
+- **Resumen:** muestra individuos, especies, posiciones, distancia y la envolvente convexa.
+- **Estudios:** permite filtrar localmente por taxon, sensor y ano de seguimiento. El ano debe tener cuatro digitos y requiere fechas de seguimiento disponibles.
+- **Individuos:** muestra la lista del estudio y los detalles del individuo seleccionado.
+- **Mapa:** presenta trayectorias, posiciones, mapa de calor y agrupaciones visuales de marcadores.
+- **Analitica:** presenta distancias diarias, recuentos por mes, ano e individuo, y permite consultar regiones con un GeoJSON local.
+
+El intervalo maximo entre posiciones y el umbral de velocidad para detenido/en movimiento se configuran en la barra lateral. Si no hay estudios, la interfaz solicita actualizar el catalogo. Mapa y Analitica muestran el aviso de descargar posiciones cuando no quedan eventos visibles para analizar, incluso si hay filas ocultas o de visibilidad desconocida almacenadas. La visibilidad desconocida se excluye del analisis por defecto; esta interfaz no ofrece una opcion para incluirla. Los filtros de estudios usan los campos que devuelve Movebank, por lo que un filtro por ano no funciona si faltan las fechas de seguimiento. Una ruta GeoJSON inaccesible o entidades sin los campos seleccionados se comunica como error.
 
 ## Notebook de consulta
 
-Abra [consulta_movebank.ipynb](consulta_movebank.ipynb) en VS Code y seleccione el kernel de `.venv`. Si no tiene soporte de notebooks en ese entorno, instale `.\.venv\Scripts\python.exe -m pip install -e ".[notebook]"`. Ejecute las celdas en orden: el notebook consulta la API real y muestra los estudios con mas de tres individuos. Sus resultados se mantienen en el notebook, no se cargan automaticamente en la cache del dashboard. Antes de compartirlo, borre sus salidas si contienen datos cuyo acceso o redistribucion este restringido.
+Abra [consulta_movebank.ipynb](consulta_movebank.ipynb) en VS Code y seleccione el kernel de `.venv`. Si no tiene soporte de notebooks en ese entorno, instale `.\.venv\Scripts\python.exe -m pip install -e ".[notebook]"`. Al ejecutar las celdas de consulta, el notebook solicita datos a Movebank; la tabla presenta todos los estudios recibidos, permite ordenar localmente por el numero de individuos cuando esta disponible y muestra los valores ausentes como no disponibles. Se puede seleccionar cualquier estudio por su identificador: no se descartan automaticamente estudios pequenos ni se consulta de nuevo al ordenar. El numero de individuos es solo un indicador inicial; evalua tambien el numero de eventos GPS, la duracion del seguimiento, la frecuencia de muestreo, la continuidad y la calidad de las coordenadas. Los resultados del notebook se mantienen ahi y no se cargan automaticamente en la cache del dashboard. Antes de compartirlo, borra sus salidas si contienen datos cuyo acceso o redistribucion este restringido.
 
 Los flujos de CLI, Streamlit y el notebook muestran el contenido de la licencia y solicitan confirmacion antes de volver a llamar con el MD5 coincidente. Si los terminos cambian, se solicita una nueva aceptacion. El MD5 es un requisito del protocolo, no una garantia criptografica, y las aceptaciones no se almacenan para uso futuro. La sesion compartida permite reutilizar las cookies administradas por `requests.Session`.
 
@@ -102,7 +132,7 @@ Con el archivo `.env` configurado, ejecute `docker compose up --build` desde est
 
 ## Datos y criterios analiticos
 
-- Se descargan GPS (`sensor_type_id=653`) por estudio e individuo, con `event_id`, identificadores, taxon y `visible`. Se omiten registros sin coordenadas; valores invalidos provocan error. Los eventos marcados `visible=false` se excluyen del analisis, no del almacenamiento. Los de visibilidad desconocida se conservan.
+- Se descargan GPS (`sensor_type_id=653`) por estudio e individuo, con `event_id`, identificadores, taxon y `visible`. Se omiten registros sin coordenadas; valores invalidos provocan error. Los eventos marcados `visible=false` y los de visibilidad desconocida (`visible=None`) se conservan en almacenamiento, pero se excluyen del analisis por defecto. El notebook permite incluir los desconocidos solo tras una decision explicita; los eventos `visible=false` nunca se incluyen.
 - Distancia: suma de geodesicas WGS84 entre posiciones consecutivas del mismo individuo. Velocidad media: distancia total dividida por tiempo entre posiciones admitidas; maxima: maxima velocidad de segmento. Distancia media: media por segmento. Dos posiciones con igual fecha no forman segmento. Intervalos superiores al maximo configurable se excluyen; distancia diaria se atribuye al dia UTC de la posicion final. Se trata de estimaciones, no de distancia real continua.
 - Detenido/en movimiento: suma de intervalos cuya velocidad de segmento es inferior/superior o igual al umbral configurable. No equivale a comportamiento observado. La duracion es el intervalo UTC entre primera y ultima posicion valida del conjunto, no la suma de tiempos de seguimiento.
 - Area: envolvente convexa de todas las posiciones seleccionadas, proyectada a Lambert azimutal equivalente local; no es una estimacion de area de campeo por KDE. La densidad es posiciones por km² de dicha envolvente. No se calcula para trayectorias que cruzan el antimeridiano. Menos de tres posiciones no producen area.
@@ -120,7 +150,7 @@ Los estudios se filtran por taxon, sensor y ano comprendido entre las fechas de 
 .\.venv\Scripts\python.exe -m mypy src
 ```
 
-La validacion de la integracion HTTP de la FASE 4 ejecuto **64 pruebas**, con **90,65 % de cobertura global** frente al minimo configurado del **80 %**. Las pruebas de transporte e integracion usan respuestas simuladas y no realizan llamadas a Movebank. El notebook no se ejecuto durante esa validacion; al ejecutarlo manualmente, consulta la API real.
+Como referencias historicas, no como resultados actuales, la validacion de integracion HTTP de la FASE 4 registro **64 pruebas** y **90,65 % de cobertura global**, y la verificacion de la FASE 5.9 registro **88 pruebas** y **93,39 % de cobertura**. El umbral configurado es **80 %**. Las pruebas de transporte e integracion usan respuestas simuladas; durante la verificacion de la FASE 5.9 se bloquearon las conexiones externas y SQLite solo se utilizo en rutas temporales aisladas. El notebook no se ejecuto ni se hicieron consultas reales a Movebank durante esa verificacion.
 
 Las pruebas controladas no sustituyen una integracion real autenticada. Para verificarla, use una cuenta propia y un estudio cuyo uso este autorizado; contraste el CSV, los permisos, los terminos y las cifras con Movebank. No se incluyen credenciales ni datos de terceros.
 
