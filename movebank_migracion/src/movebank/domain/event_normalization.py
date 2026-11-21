@@ -161,6 +161,10 @@ def normalize_events(rows: Iterable[Mapping[str, object]]) -> EventNormalization
             rejected["invalid_coordinates"] += 1
             continue
 
+        if _is_missing(values.get("timestamp")):
+            rejected["invalid_timestamp"] += 1
+            continue
+
         try:
             event = Event.model_validate(values)
         except ValidationError as exc:

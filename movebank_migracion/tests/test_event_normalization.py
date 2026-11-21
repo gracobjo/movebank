@@ -321,27 +321,26 @@ class TestNormalizeTimestamp:
         assert result.rejected_by_reason["invalid_timestamp"] == 1
 
     def test_pandas_nat_timestamp_rejected(self):
-        """pd.NaT causes issues during validation, test that it's not accepted.
+        """pandas.NaT is properly rejected as an invalid timestamp.
         
-        pandas.NaT (Not-a-Time) is a special value that may cause TypeError or ValueError
-        when processed through event validation. The test verifies that such values are
-        properly handled (either rejected or raise appropriately) and do not pass validation.
+        pandas.NaT (Not-a-Time) is a special value that cannot be converted to a
+        standard Python datetime. The test verifies that it is rejected with the
+        'invalid_timestamp' reason and does not appear in accepted events.
         """
         row = base_valid_row()
-        try:
-            result = normalize_events([row.copy() | {"timestamp": pd.NaT}])
-            # Either rejected or raises (both are acceptable)
-            assert result.rejected_count >= 1 or True
-        except (TypeError, ValueError):
-            # Type errors from pd.NaT are expected and acceptable
-            # This documents that pandas special values may require exception handling
-            pass
+        result = normalize_events([row.copy() | {"timestamp": pd.NaT}])
+        assert result.rejected_count == 1
+        assert result.rejected_by_reason.get("invalid_timestamp") == 1
+        assert result.accepted_count == 0
 
     def test_numpy_nat_timestamp_rejected(self):
+        """numpy.datetime64('NaT') is properly rejected as an invalid timestamp."""
         row = base_valid_row()
         row["timestamp"] = np.datetime64("NaT")
         result = normalize_events([row])
-        assert result.rejected_count >= 1
+        assert result.rejected_count == 1
+        assert result.rejected_by_reason.get("invalid_timestamp") == 1
+        assert result.accepted_count == 0
 
 
 class TestNormalizeIndividualId:
